@@ -12,8 +12,7 @@ import webbrowser
 from pathlib import Path
 
 import keyring
-from send2trash import send2trash
-from PySide6.QtCore import Qt, QTimer, Signal, QObject, QRectF, QPoint, QUrl
+from PySide6.QtCore import QFile, Qt, QTimer, Signal, QObject, QRectF, QPoint, QUrl
 from PySide6.QtGui import QAction, QActionGroup, QFont, QFontDatabase, QIcon, QPainter, QPixmap, QColor, QPainterPath, QPen, QTransform
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtWidgets import (
@@ -620,65 +619,73 @@ class Pet(QWidget):
             self.tray.contextMenu().popup(event.globalPos())
 
     def dragEnterEvent(self, event):
-        if self.transfer.state != "idle":
-            if (self.transfer.state == "connected" and event.mimeData().hasUrls()
-                    and len(event.mimeData().urls()) == 1 and event.mimeData().urls()[0].isLocalFile()):
-                event.setDropAction(Qt.DropAction.CopyAction)
-                event.accept()
-            return
-        if self.reading_mode:
-            if event.mimeData().hasUrls() and len(event.mimeData().urls()) == 1 and event.mimeData().urls()[0].isLocalFile():
-                event.setDropAction(Qt.DropAction.CopyAction); event.accept()
-            return
-        if event.mimeData().hasUrls() and all(url.isLocalFile() for url in event.mimeData().urls()):
-            event.setDropAction(Qt.DropAction.CopyAction)
-            event.accept()
-
-    def dropEvent(self, event):
-        files = [url.toLocalFile() for url in event.mimeData().urls() if url.isLocalFile()]
-        if self.transfer.state != "idle":
-            if (self.transfer.state == "connected" and len(files) == 1
-                    and QRectF(82, 169, 56, 38).contains(event.position())):
-                self.transfer.send_file(files[0])
-                event.setDropAction(Qt.DropAction.CopyAction)
-                event.accept()
-            return
-        if self.reading_mode:
-            if len(files) == 1:
-                self.summarize_file(files[0])
-                event.setDropAction(Qt.DropAction.CopyAction); event.accept()
-            return
-        successes = 0
-        for file in files:
-            try:
-                send2trash(file)
-                successes += 1
-            except (OSError, RuntimeError):
-                pass
-        if successes:
-            self.phase = "trash"
-            self.phase_until = self.tick + 72
-            event.setDropAction(Qt.DropAction.CopyAction)
-            event.accept()
-        self.say(f"已移入回收站 {successes} 个，失败 {len(files) - successes} 个。")
+        self.accept_file_drag(event, entering=True)
 
     def dragMoveEvent(self, event):
-        if self.transfer.state == "idle" and self.reading_mode:
-            if event.mimeData().hasUrls() and len(event.mimeData().urls()) == 1 and event.mimeData().urls()[0].isLocalFile():
-                event.setDropAction(Qt.DropAction.CopyAction); event.accept()
-            else:
-                event.ignore()
-        elif self.transfer.state == "idle":
-            event.acceptProposedAction()
-        elif (self.transfer.state == "connected"
-              and QRectF(82, 169, 56, 38).contains(event.position())
-              and event.mimeData().hasUrls()
-              and len(event.mimeData().urls()) == 1
-              and event.mimeData().urls()[0].isLocalFile()):
+        self.accept_file_drag(event)
+
+    def accept_file_drag(self, event, *, entering=False):
+        if self.dropped_files(event, entering=entering):
             event.setDropAction(Qt.DropAction.CopyAction)
             event.accept()
         else:
             event.ignore()
+
+    def dropped_files(self, event, *, entering=False):
+        # Qt can fall back to MoveAction when the source does not offer CopyAction.
+        if not (event.possibleActions() & Qt.DropAction.CopyAction):
+            return []
+        files = [url.toLocalFile() for url in event.mimeData().urls()]
+        if not files or any("\0" in file or not Path(file).is_absolute() for file in files):
+            return []
+        if self.transfer.state != "idle":
+            if self.transfer.state != "connected" or len(files) != 1:
+                return []
+            if not entering and not QRectF(82, 169, 56, 38).contains(event.position()):
+                return []
+        elif self.reading_mode and len(files) != 1:
+            return []
+        return files
+
+    def dropEvent(self, event):
+        event.ignore()
+        files = self.dropped_files(event)
+        if not files:
+            return
+        if self.transfer.state != "idle":
+            self.transfer.send_file(files[0])
+        elif self.reading_mode:
+            self.summarize_file(files[0])
+        elif not self.trash_files(files):
+            return
+        event.setDropAction(Qt.DropAction.CopyAction)
+        event.accept()
+
+    def trash_files(self, files):
+        successes = 0
+        failures = []
+        for path in files:
+            file = QFile(path)
+            # Qt's Windows backend requests recycling and vetoes permanent deletion.
+            if not file.moveToTrash():
+                failures.append(f"{Path(path).name}：{file.errorString()}")
+                continue
+            # Windows reports the new path when the shell creates a Recycle Bin item.
+            if not file.fileName():
+                failures.append(f"{Path(path).name}：无法确认已移入回收站")
+                continue
+            successes += 1
+        if successes:
+            self.phase = "trash"
+            self.phase_until = self.tick + 72
+            message = f"已移入回收站 {successes} 个"
+        else:
+            message = "没能移入回收站"
+        if failures:
+            self.say(f"{message}，失败 {len(failures)} 个：" + "；".join(failures)[:90])
+        else:
+            self.say(message + "。")
+        return successes > 0
 
     def configure(self):
         dialog = SettingsDialog(self.settings, self)
