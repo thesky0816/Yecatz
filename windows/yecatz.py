@@ -625,17 +625,31 @@ class Pet(QWidget):
                     and len(event.mimeData().urls()) == 1 and event.mimeData().urls()[0].isLocalFile()):
                 event.setDropAction(Qt.DropAction.CopyAction)
                 event.accept()
+            else:
+                event.ignore()
             return
         if self.reading_mode:
             if event.mimeData().hasUrls() and len(event.mimeData().urls()) == 1 and event.mimeData().urls()[0].isLocalFile():
                 event.setDropAction(Qt.DropAction.CopyAction); event.accept()
+            else:
+                event.ignore()
             return
         if event.mimeData().hasUrls() and all(url.isLocalFile() for url in event.mimeData().urls()):
             event.setDropAction(Qt.DropAction.CopyAction)
             event.accept()
+        else:
+            event.ignore()
+
+    @staticmethod
+    def dropped_files(event):
+        # QUrl.toLocalFile() 在 Windows 上返回正斜杠路径（C:/Users/...）。send2trash 的
+        # Windows 后端会加上 \\?\\ 前缀再调用 GetShortPathNameW，而 \\?\\ 只接受反斜杠，
+        # 于是必然抛 FileNotFoundError，文件进不了回收站。统一规范成本地反斜杠路径。
+        return [os.path.normpath(url.toLocalFile())
+                for url in event.mimeData().urls() if url.isLocalFile()]
 
     def dropEvent(self, event):
-        files = [url.toLocalFile() for url in event.mimeData().urls() if url.isLocalFile()]
+        files = self.dropped_files(event)
         if self.transfer.state != "idle":
             if (self.transfer.state == "connected" and len(files) == 1
                     and QRectF(82, 169, 56, 38).contains(event.position())):
@@ -648,19 +662,25 @@ class Pet(QWidget):
                 self.summarize_file(files[0])
                 event.setDropAction(Qt.DropAction.CopyAction); event.accept()
             return
+        event.setDropAction(Qt.DropAction.CopyAction)
+        event.accept()
+        if not files:
+            return
         successes = 0
+        failures = []
         for file in files:
             try:
                 send2trash(file)
                 successes += 1
-            except (OSError, RuntimeError):
-                pass
+            except Exception as error:  # 任何失败都不能中断拖放，也不能谎报成功
+                failures.append(f"{Path(file).name}：{error}")
         if successes:
             self.phase = "trash"
             self.phase_until = self.tick + 72
-            event.setDropAction(Qt.DropAction.CopyAction)
-            event.accept()
-        self.say(f"已移入回收站 {successes} 个，失败 {len(files) - successes} 个。")
+        if failures:
+            self.say("没能移入回收站：" + "；".join(failures)[:90])
+        else:
+            self.say(f"已移入回收站 {successes} 个。")
 
     def dragMoveEvent(self, event):
         if self.transfer.state == "idle" and self.reading_mode:
@@ -669,7 +689,13 @@ class Pet(QWidget):
             else:
                 event.ignore()
         elif self.transfer.state == "idle":
-            event.acceptProposedAction()
+            # 明确只接受复制：acceptProposedAction() 会让资源管理器给出“移动”，
+            # 与回收站流程语义冲突。
+            if event.mimeData().hasUrls() and all(url.isLocalFile() for url in event.mimeData().urls()):
+                event.setDropAction(Qt.DropAction.CopyAction)
+                event.accept()
+            else:
+                event.ignore()
         elif (self.transfer.state == "connected"
               and QRectF(82, 169, 56, 38).contains(event.position())
               and event.mimeData().hasUrls()
